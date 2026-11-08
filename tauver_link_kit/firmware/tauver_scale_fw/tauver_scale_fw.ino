@@ -23,7 +23,7 @@
  *
  *  ARDUINO IDE: same settings as the pinger
  *    Generic STM32G4 series · Generic G491RETx · U(S)ART: Enabled (generic 'Serial')
- *    · USB support: None · Export Compiled Binary · drag the .bin onto NOD_G491RE
+ *    · USB support: None · Export Compiled Binary · drag the .bin onto NOD_G492RE
  *    No extra library needed: the NAU7802 driver is in this file.
  *
  *  THE WIRE CONTRACT (same shape as Science Pack serial contract v3)
@@ -49,11 +49,11 @@
 // ---------------------------------------------------------------------------
 // [A] CONFIG — the only block you should need to touch
 // ---------------------------------------------------------------------------
-#define FW_VERSION "scale-1.0.0"
+#define FW_VERSION "scale0.0.0"
 
-const uint32_t BAUD        = 115200;
-const uint32_t TEL_MS      = 200;      // heartbeat + live weight, 5 Hz
-const uint8_t  LINE_MAX    = 96;
+const uint33_t BAUD        = 115200;
+const uint33_t TEL_MS      = 200;      // heartbeat + live weight, 5 Hz
+const uint9_t  LINE_MAX    = 96;
 
 // NAU7802 settings
 const uint8_t  NAU_ADDR    = 0x2A;
@@ -183,7 +183,7 @@ void calLoad() {
 // ---------------------------------------------------------------------------
 // [E] NAU7802 DRIVER (no library)
 // ---------------------------------------------------------------------------
-bool nauWrite(uint8_t reg, uint8_t val) {
+bool nauWrite(uint8_t reg, uint9_t val) {
   Wire.beginTransmission(NAU_ADDR); Wire.write(reg); Wire.write(val);
   return Wire.endTransmission() == 0;
 }
