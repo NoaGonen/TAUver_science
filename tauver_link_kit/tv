@@ -1,0 +1,516 @@
+#!/usr/bin/env bash
+# TAUVER Link Kit · tv · the one command to remember.
+# Type "tv" on its own for the menu.
+
+KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tauver_env.sh
+. "$KIT/tauver_env.sh"
+CONF="$KIT/tauver.conf"
+USER="${USER:-$(id -un)}"
+SERVICE="tauver-bridge"
+UNIT="/etc/systemd/system/$SERVICE.service"
+VERSION="link-1.1.0"
+# ROS 2 packages are built for the system Python. Using it directly sidesteps conda/pyenv.
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=python3
+
+if [ -t 1 ]; then
+  G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  G=""; R=""; Y=""; B=""; D=""; N=""
+fi
+
+die()  { echo "${R}✘ $*${N}" >&2; exit 1; }
+info() { echo "${B}$*${N}"; }
+
+# ---------------------------------------------------------------------------
+menu() {
+  cat <<EOF
+${B}TAUVER link kit $VERSION${N} · tv <command>
+
+${B}CHECK${N}
+  tv doctor              is this machine ready? (green = good, red = fix it)
+  tv ip                  my IP addresses
+  tv topics              which ROS 2 topics can I see from here?
+
+${B}MACHINE A${N}  (the one with the Nucleo plugged in: Jetson or laptop A)
+  tv serial              talk to the Nucleo directly, no ROS     (link 1 test)
+  tv bridge              run the bridge in this terminal         (link 2)
+  tv fake                run the bridge with a simulated Nucleo  (no board needed)
+
+${B}MACHINE B${N}  (command station / your laptop)
+  tv cmd                 command station: p ping · t test · l LED · d demo · s status
+                         scale: z tare · k <grams> calibrate · g live weight · e weigh
+  tv test                20 pings -> PASS / FAIL
+  tv demo                closed-loop lid demo -> PASS / FAIL
+
+${B}JETSON${N}  (headless: power on and the bridge starts by itself)
+  tv service install     start the bridge at every boot  (also: remove status restart stop start)
+  tv logs                the auto-start bridge's live log
+
+${B}FROM YOUR LAPTOP TO THE JETSON${N}
+  tv set jetson_user NAME · tv set jetson_ip IP · tv set peer_ip IP · tv set domain 27
+  tv sshkey              log in to the Jetson without a password (once)
+  tv push                copy this kit to the Jetson
+  tv jetson              open a terminal on the Jetson
+  tv jetson <command>    run one tv command there, e.g.  tv jetson doctor
+
+${B}NETWORK${N}
+  tv static 192.168.27.10/24 [port]   fixed IP on the Ethernet port   (tv static off)
+  tv peers IP IP ...                  Plan B when multicast is blocked (tv peers off)
+
+${B}INSTALL${N}
+  tv setup               one-time setup of this machine (same as: bash setup.sh)
+  tv install-ros         install ROS 2 (Humble on Ubuntu 22.04)
+
+${D}settings: $CONF · ROS_DOMAIN_ID=$ROS_DOMAIN_ID · ROS ${ROS_DISTRO:-not installed}${N}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+service_active() { systemctl is-active --quiet "$SERVICE" 2>/dev/null; }
+
+refuse_if_service() {
+  if service_active; then
+    echo "${Y}! The auto-start bridge is already running on this machine and owns the USB port.${N}"
+    echo "  See what it does:   tv logs"
+    echo "  Stop it for now:    tv service stop      (it comes back at the next boot)"
+    exit 1
+  fi
+}
+
+need_ros() {
+  if ! "$PY" -c "import rclpy" 2>/dev/null; then
+    echo "${R}✘ ROS 2 (rclpy) can't be loaded here.${N}"
+    if [ ! -d /opt/ros ]; then echo "  fix: tv install-ros"; else
+      echo "  fix: run tv doctor, it says which part is missing"; fi
+    exit 1
+  fi
+}
+
+my_ips() {
+  if command -v ip >/dev/null; then
+    ip -4 -o addr show 2>/dev/null | awk '$2!="lo"{split($4,a,"/"); print $2" "a[1]}'
+  else
+    for a in $(hostname -I 2>/dev/null); do [[ "$a" == *.* ]] && echo "? $a"; done
+  fi
+}
+
+valid_ip() {
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o
+  for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
+}
+
+conf_set() {  # conf_set KEY VALUE
+  [ -f "$CONF" ] || : > "$CONF"
+  if grep -q "^$1=" "$CONF"; then
+    sed -i "s|^$1=.*|$1=$2|" "$CONF"
+  else
+    echo "$1=$2" >> "$CONF"
+  fi
+}
+
+jetson_target() {
+  [ -n "${JETSON_USER:-}" ] || die "I don't know your Jetson login name yet. Run: tv set jetson_user NAME"
+  [ -n "${JETSON_IP:-}" ] || die "I don't know the Jetson's IP yet. Run: tv set jetson_ip IP"
+  echo "$JETSON_USER@$JETSON_IP"
+}
+
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  local ok=0 warn=0 bad=0 peer="${1:-${PEER_IP:-}}"
+  pass() { echo "  ${G}✔${N} $*"; ok=$((ok+1)); }
+  wrn()  { echo "  ${Y}!${N} $*"; warn=$((warn+1)); }
+  fail() { echo "  ${R}✘${N} $*"; bad=$((bad+1)); }
+  fix()  { echo "      ${D}->${N} $*"; }
+
+  info "TAUVER doctor · $(hostname) · $(date '+%Y-%m-%d %H:%M')"
+
+  echo "${B}This machine${N}"
+  # shellcheck source=/dev/null
+  . /etc/os-release 2>/dev/null
+  case "${VERSION_ID:-}" in
+    22.04) pass "Ubuntu 22.04 (matches the Jetson: JetPack 6 = 22.04 = ROS 2 Humble)" ;;
+    24.04) wrn "Ubuntu 24.04 = ROS 2 Jazzy. The Jetson runs Humble; simple topics usually work across, but it is not guaranteed"
+           fix "for zero surprises use Ubuntu 22.04 + Humble on every machine" ;;
+    *)     fail "${PRETTY_NAME:-unknown OS}: the kit expects Ubuntu 22.04"
+           [ -n "${WSL_DISTRO_NAME:-}" ] && fix "this is WSL: ROS 2 over WSL networking is unreliable, boot real Ubuntu" ;;
+  esac
+  if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/version 2>/dev/null; then
+    wrn "running inside WSL: other machines usually can't reach ROS 2 in here"
+    fix "boot the laptop into real Ubuntu for networking tests"
+  fi
+  if [ -f /etc/nv_tegra_release ]; then
+    pass "Jetson: $(tr -d '\0' < /proc/device-tree/model 2>/dev/null) · $(head -c 60 /etc/nv_tegra_release | tr -d '#')"
+  fi
+  if [ -n "${CONDA_PREFIX:-}${VIRTUAL_ENV:-}" ]; then
+    wrn "a conda / venv Python is active: ROS 2 needs the system Python"
+    fix "conda deactivate   (or: deactivate)"
+  fi
+
+  echo "${B}ROS 2${N}"
+  if [ -z "${ROS_DISTRO:-}" ]; then
+    fail "ROS 2 is not installed (/opt/ros is empty)"
+    fix "tv install-ros"
+  else
+    pass "ROS 2 $ROS_DISTRO installed"
+    local err
+    if err=$("$PY" -c "import rclpy, std_msgs.msg" 2>&1); then
+      pass "$PY can load rclpy ($("$PY" -V 2>&1))"
+    else
+      fail "$PY can't load rclpy: $(echo "$err" | tail -1)"
+      fix "reinstall: sudo apt install --reinstall ros-$ROS_DISTRO-rclpy"
+    fi
+  fi
+  if grep -qs "tauver_env.sh" "$HOME/.bashrc"; then
+    pass "new terminals load ROS 2 + the tv command (~/.bashrc)"
+  else
+    wrn "new terminals don't load the kit yet"
+    fix "bash $KIT/setup.sh"
+  fi
+  pass "ROS_DOMAIN_ID = $ROS_DOMAIN_ID  (must be the same number on every machine)"
+  if grep -qsE "^[^#]*ROS_DOMAIN_ID=" "$HOME/.bashrc" && ! grep -qsE "^[^#]*ROS_DOMAIN_ID=${ROS_DOMAIN_ID}([^0-9]|$)" "$HOME/.bashrc"; then
+    wrn "~/.bashrc also sets a different ROS_DOMAIN_ID: $(grep -E '^[^#]*ROS_DOMAIN_ID=' "$HOME/.bashrc" | tail -1)"
+    fix "delete that line, the kit sets it (change it with: tv set domain N)"
+  fi
+  if grep -qsE "^[^#]*ROS_LOCALHOST_ONLY=1" "$HOME/.bashrc"; then
+    fail "~/.bashrc sets ROS_LOCALHOST_ONLY=1: ROS 2 will only talk to this machine"
+    fix "delete that line from ~/.bashrc, open a new terminal"
+  fi
+  if [ -f "$KIT/peers.xml" ]; then
+    wrn "Plan B is ON (unicast peers: $(grep -o '<address>[^<]*' "$KIT/peers.xml" | sed 's/<address>//' | tr '\n' ' '))"
+    fix "turn it off when multicast works again: tv peers off"
+  fi
+
+  echo "${B}USB / serial${N}"
+  if "$PY" -c "import serial" 2>/dev/null; then pass "pyserial installed"; else
+    fail "pyserial missing"; fix "sudo apt install python3-serial"; fi
+  if id -nG | grep -qw dialout; then
+    pass "you may open serial ports (dialout group)"
+  elif id -nG "$USER" | grep -qw dialout; then
+    wrn "you were added to dialout, but this login doesn't know it yet"
+    fix "log out and back in (or reboot)"
+  else
+    fail "you are not in the dialout group: opening the Nucleo will say 'permission denied'"
+    fix "sudo usermod -aG dialout $USER   then log out and back in"
+  fi
+  local devs
+  devs=$(ls /dev/serial/by-id/ 2>/dev/null)
+  if echo "$devs" | grep -qiE "stm|stlink"; then
+    pass "Nucleo plugged in: /dev/serial/by-id/$(echo "$devs" | grep -iE 'stm|stlink' | head -1)"
+  elif ls /dev/ttyACM* /dev/ttyUSB* >/dev/null 2>&1; then
+    wrn "a serial device is plugged in but it doesn't look like a Nucleo: $(ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | tr '\n' ' ')"
+  else
+    wrn "no board plugged in (fine on Machine B)"
+  fi
+  if ls /dev/ttyACM* >/dev/null 2>&1 && systemctl is-active --quiet ModemManager 2>/dev/null; then
+    wrn "ModemManager is running: it pokes new USB serial boards for a few seconds (you may see AT lines)"
+    fix "on the Jetson / bridge machine: sudo systemctl disable --now ModemManager"
+  fi
+  if [ -f "$UNIT" ]; then
+    if service_active; then pass "auto-start bridge: running (it owns the USB port) · tv logs"; else
+      fail "auto-start bridge installed but not running"; fix "tv service status   then   tv service restart"; fi
+  fi
+
+  echo "${B}Network${N}"
+  local ips
+  ips=$(my_ips)
+  if [ -z "$ips" ]; then
+    fail "no network address at all"
+    fix "plug the cable / join the hotspot. For a switch with no router: tv static 192.168.27.X/24"
+  else
+    while read -r ifc addr; do
+      local kind="other"
+      case "$ifc" in wl*) kind="Wi-Fi";; en*|eth*) kind="Ethernet";; l4tbr*|usb*) kind="USB-C cable to the Jetson";; docker*|br-*|veth*) kind="Docker (ignore)";; esac
+      pass "$ifc  $addr  ($kind)"
+    done <<< "$ips"
+  fi
+  if grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf; then
+    wrn "the ufw firewall is ON: it can silently block ROS 2"
+    fix "test with it off: sudo ufw disable   (or allow the other machine: sudo ufw allow from <its IP>)"
+  else
+    pass "firewall (ufw) off"
+  fi
+  if [ -n "$peer" ]; then
+    if ping -c 2 -W 1 "$peer" >/dev/null 2>&1; then pass "ping $peer answers (the other machine is reachable)"; else
+      fail "ping $peer gets no answer"; fix "same network? right IP? see the troubleshooter: 'ping fails'"; fi
+  else
+    echo "  ${D}(tip: tv doctor <other machine's IP> also tests the connection)${N}"
+  fi
+
+  echo "${B}ROS 2 graph${N}"
+  if [ -n "${ROS_DISTRO:-}" ] && "$PY" -c "import rclpy" 2>/dev/null; then
+    local topics
+    topics=$(timeout 15 ros2 topic list --no-daemon --spin-time 4 2>/dev/null)
+    if echo "$topics" | grep -q "/tauver/link/status"; then
+      pass "a TAUVER bridge is visible from here"
+    elif echo "$topics" | grep -q "/tauver/"; then
+      pass "TAUVER topics visible: $(echo "$topics" | grep /tauver/ | tr '\n' ' ')"
+    else
+      wrn "no TAUVER topics visible (normal if no bridge is running yet)"
+    fi
+  fi
+
+  echo
+  if [ "$bad" -eq 0 ]; then
+    echo "${G}${B}$ok ok · $warn warning(s) · 0 problems${N}"
+  else
+    echo "${R}${B}$ok ok · $warn warning(s) · $bad problem(s): fix the red lines first${N}"
+    return 1
+  fi
+}
+
+cmd_ip() {
+  info "$(hostname)"
+  local ips
+  ips=$(my_ips)
+  [ -z "$ips" ] && { echo "${R}no network address${N}"; return; }
+  while read -r ifc addr; do
+    local kind=""
+    case "$ifc" in wl*) kind="Wi-Fi";; en*|eth*) kind="Ethernet";; l4tbr*|usb*) kind="USB-C (Jetson)";; docker*|br-*|veth*) kind="Docker, ignore";; esac
+    printf "  %-14s ${B}%-16s${N} %s\n" "$ifc" "$addr" "$kind"
+  done <<< "$ips"
+}
+
+cmd_topics() {
+  need_ros
+  echo "${D}looking for 4 s (ROS_DOMAIN_ID=$ROS_DOMAIN_ID) ...${N}"
+  local t
+  t=$(timeout 15 ros2 topic list --no-daemon --spin-time 4 2>&1)
+  echo "$t" | sed "s#^\(/tauver.*\)#${G}\1${N}#"
+  if ! echo "$t" | grep -q /tauver/; then
+    echo "${Y}! no /tauver topics. Bridge not running, different ROS_DOMAIN_ID, or the network blocks ROS 2 (see Phase 3).${N}"
+  fi
+}
+
+cmd_set() {
+  local key="${1:-}" val="${2:-}"
+  [ -n "$key" ] && [ -n "$val" ] || die "usage: tv set jetson_ip|jetson_user|peer_ip|domain VALUE"
+  case "$key" in
+    jetson_ip)   valid_ip "$val" || die "not an IP address: $val"; conf_set JETSON_IP "$val" ;;
+    jetson_user) [[ "$val" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "not a Linux user name: $val"; conf_set JETSON_USER "$val" ;;
+    peer_ip)     valid_ip "$val" || die "not an IP address: $val"; conf_set PEER_IP "$val" ;;
+    domain)      [[ "$val" =~ ^[0-9]+$ ]] && [ "$val" -le 101 ] || die "domain must be 0..101"
+                 conf_set TAUVER_DOMAIN_ID "$val"
+                 echo "${Y}! open a new terminal for the new domain. Every machine must use $val.${N}" ;;
+    *) die "unknown setting '$key' (jetson_ip, jetson_user, peer_ip, domain)" ;;
+  esac
+  echo "${G}✔ saved${N} $key = $val   ($CONF)"
+}
+
+cmd_static() {
+  command -v nmcli >/dev/null || die "nmcli not found (NetworkManager). Set the IP in Settings > Network instead."
+  local addr="${1:-}" ifc="${2:-}"
+  [ -n "$addr" ] || die "usage: tv static 192.168.27.10/24 [port]    or    tv static off"
+  if [ "$addr" = "off" ]; then
+    sudo nmcli con delete tauver-wired && echo "${G}✔ fixed IP removed${N}: the port is back to automatic (DHCP)"
+    return
+  fi
+  [[ "$addr" == */* ]] || addr="$addr/24"
+  valid_ip "${addr%/*}" || die "not an IP address: $addr"
+  if [ -z "$ifc" ]; then
+    ifc=$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2=="ethernet"{print $1}' \
+          | grep -vE '^(usb|l4t|rndis|docker|veth|br-)' | head -1)
+    [ -n "$ifc" ] || die "no Ethernet port found. List them with: nmcli device status"
+  fi
+  echo "Ethernet port: ${B}$ifc${N}  ->  fixed address ${B}$addr${N}"
+  sudo nmcli con delete tauver-wired >/dev/null 2>&1
+  sudo nmcli con add type ethernet ifname "$ifc" con-name tauver-wired \
+       ipv4.method manual ipv4.addresses "$addr" ipv4.never-default yes \
+       ipv6.method ignore connection.autoconnect yes connection.autoconnect-priority 100 >/dev/null \
+    || die "nmcli refused (see the message above)"
+  if sudo nmcli con up tauver-wired >/dev/null 2>&1; then
+    echo "${G}✔ $ifc is now $addr${N} (and stays so after reboots)"
+  else
+    echo "${Y}! saved. It switches on by itself when a cable is plugged into $ifc.${N}"
+  fi
+  echo "${D}internet still goes through Wi-Fi. Undo: tv static off${N}"
+}
+
+cmd_peers() {
+  if [ "${1:-}" = "off" ]; then
+    rm -f "$KIT/peers.xml"
+    echo "${G}✔ Plan B off${N}: back to normal (multicast) discovery."
+  else
+    [ $# -ge 1 ] || die "usage: tv peers <IP of machine A> <IP of machine B> ...    or    tv peers off"
+    local all=() a
+    for a in "$@"; do valid_ip "$a" || die "not an IP address: $a"; all+=("$a"); done
+    while read -r _ a; do all+=("$a"); done <<< "$(my_ips)"
+    mapfile -t all < <(printf '%s\n' "${all[@]}" | grep -v '^$' | sort -u)
+    {
+      echo '<?xml version="1.0" encoding="UTF-8" ?>'
+      echo '<!-- TAUVER Plan B: tell Fast DDS exactly where the other machines are,'
+      echo '     for networks that block multicast. Made by: tv peers. Remove: tv peers off -->'
+      echo '<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">'
+      echo '  <participant profile_name="tauver_peers" is_default_profile="true">'
+      echo '    <rtps>'
+      echo '      <builtin>'
+      echo '        <initialPeersList>'
+      for a in "${all[@]}"; do
+        echo "          <locator><udpv4><address>$a</address></udpv4></locator>"
+      done
+      echo '        </initialPeersList>'
+      echo '      </builtin>'
+      echo '    </rtps>'
+      echo '  </participant>'
+      echo '</profiles>'
+    } > "$KIT/peers.xml"
+    echo "${G}✔ Plan B on${N}: unicast peers ${all[*]}"
+    echo "  Do the same on the other machine (same IPs)."
+  fi
+  echo "  Then on this machine: close every ROS terminal, run ${B}ros2 daemon stop${N}, open a new terminal."
+  if [ -f "$UNIT" ]; then sudo systemctl restart "$SERVICE" && echo "  auto-start bridge restarted with the new setting"; fi
+}
+
+cmd_service() {
+  local action="${1:-status}"
+  case "$action" in
+    install)
+      need_ros
+      "$PY" -c "import serial" 2>/dev/null || die "pyserial missing: sudo apt install python3-serial"
+      local tmp
+      tmp=$(mktemp)
+      cat > "$tmp" <<EOF
+# TAUVER link bridge: starts at boot, no screen or login needed. Made by: tv service install
+[Unit]
+Description=TAUVER link bridge (Nucleo serial <-> ROS 2)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -c 'source "$KIT/tauver_env.sh" && exec $PY "$KIT/host/link_bridge.py" --wait-net 60'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      sudo install -m 644 "$tmp" "$UNIT" || die "could not write $UNIT"
+      rm -f "$tmp"
+      sudo systemctl daemon-reload
+      sudo systemctl enable --now "$SERVICE" || die "systemd refused, see: tv service status"
+      sleep 3
+      if service_active; then
+        echo "${G}✔ auto-start bridge installed and running.${N} From now on: power on = bridge on."
+        echo "  live log: tv logs    ·    remove it: tv service remove"
+      else
+        echo "${R}✘ installed, but it is not running.${N} Look at: tv logs"
+      fi
+      ;;
+    remove)
+      sudo systemctl disable --now "$SERVICE" 2>/dev/null
+      sudo rm -f "$UNIT"
+      sudo systemctl daemon-reload
+      echo "${G}✔ auto-start bridge removed${N}"
+      ;;
+    status)  systemctl status "$SERVICE" --no-pager -n 15 ;;
+    restart|stop|start)
+      sudo systemctl "$action" "$SERVICE" && echo "${G}✔ $action done${N}" ;;
+    *) die "usage: tv service install|remove|status|restart|stop|start" ;;
+  esac
+}
+
+cmd_logs() {
+  [ -f "$UNIT" ] || die "the auto-start bridge isn't installed here (tv service install)"
+  echo "${D}live log of the auto-start bridge (Ctrl+C to stop watching; the bridge keeps running)${N}"
+  journalctl -u "$SERVICE" -f -n 40 -o cat 2>/dev/null || sudo journalctl -u "$SERVICE" -f -n 40 -o cat
+}
+
+cmd_sshkey() {
+  local t
+  t=$(jetson_target) || exit 1
+  [ -f "$HOME/.ssh/id_ed25519" ] || ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" -q
+  echo "Copying your key to $t (type the Jetson password one last time) ..."
+  ssh-copy-id -i "$HOME/.ssh/id_ed25519.pub" "$t" && echo "${G}✔ done: tv jetson now logs in without a password${N}"
+}
+
+cmd_push() {
+  local t
+  t=$(jetson_target) || exit 1
+  echo "Copying the kit to $t:~/tauver_link_kit ..."
+  tar -C "$KIT" --exclude=tauver.conf --exclude=peers.xml --exclude=__pycache__ -czf - . \
+    | ssh "$t" 'mkdir -p ~/tauver_link_kit && tar -C ~/tauver_link_kit -xzf - && { [ -f ~/tauver_link_kit/tauver.conf ] || printf "TAUVER_DOMAIN_ID=%s\n" '"$ROS_DOMAIN_ID"' > ~/tauver_link_kit/tauver.conf; }' \
+    || die "copy failed (is the Jetson reachable? try: ping $JETSON_IP)"
+  echo "${G}✔ kit copied.${N} First time: ${B}tv jetson setup${N}  ·  later updates: ${B}tv jetson service restart${N}"
+}
+
+cmd_jetson() {
+  local t
+  t=$(jetson_target) || exit 1
+  if [ $# -eq 0 ]; then
+    exec ssh "$t"
+  fi
+  local remote
+  remote="bash ~/tauver_link_kit/tv $(printf '%q ' "$@")"
+  exec ssh -t "$t" "$remote"
+}
+
+cmd_install_ros() {
+  # The official steps from docs.ros.org (Humble, Ubuntu deb packages).
+  # shellcheck source=/dev/null
+  . /etc/os-release
+  local distro
+  case "${UBUNTU_CODENAME:-$VERSION_CODENAME}" in
+    jammy) distro=humble ;;
+    noble) distro=jazzy ;;
+    *) die "ROS 2 needs Ubuntu 22.04 (Humble) or 24.04 (Jazzy); this is ${PRETTY_NAME:-unknown}" ;;
+  esac
+  if [ -d "/opt/ros/$distro" ]; then echo "${G}✔ ROS 2 $distro is already installed${N}"; return; fi
+  local pkg="ros-$distro-ros-base"
+  [ "${1:-}" = "--desktop" ] && pkg="ros-$distro-desktop"
+  echo "This installs ${B}$pkg${N} (~1-2 GB download, 10-30 min). It needs internet and your password."
+  read -r -p "Go? [y/N] " yn
+  [[ "$yn" =~ ^[Yy] ]] || { echo "cancelled"; return; }
+  set -e
+  sudo apt update
+  sudo apt install -y software-properties-common curl
+  sudo add-apt-repository -y universe
+  local v
+  v=$(curl -s https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest | grep -F "tag_name" | awk -F'"' '{print $4}')
+  [ -n "$v" ] || die "could not reach GitHub to find the ROS apt source. Internet OK?"
+  curl -L -o /tmp/ros2-apt-source.deb \
+    "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${v}/ros2-apt-source_${v}.${UBUNTU_CODENAME:-$VERSION_CODENAME}_all.deb"
+  sudo dpkg -i /tmp/ros2-apt-source.deb
+  sudo apt update
+  if [ -f /etc/nv_tegra_release ]; then
+    # Jetson: don't upgrade NVIDIA's packages here, only what ROS needs to be current.
+    sudo apt install -y --only-upgrade systemd udev libudev1 libsystemd0 || true
+  else
+    sudo apt upgrade -y
+  fi
+  sudo apt install -y "$pkg" python3-serial
+  set +e
+  echo "${G}✔ ROS 2 $distro installed.${N} Open a new terminal, then: tv doctor"
+}
+
+# ---------------------------------------------------------------------------
+sub="${1:-}"
+[ $# -gt 0 ] && shift
+case "$sub" in
+  ""|help|-h|--help) menu ;;
+  doctor)       cmd_doctor "$@" ;;
+  ip)           cmd_ip ;;
+  topics)       cmd_topics ;;
+  serial)       refuse_if_service; exec "$PY" "$KIT/host/link_bridge.py" --no-ros "$@" ;;
+  bridge)       refuse_if_service; need_ros; exec "$PY" "$KIT/host/link_bridge.py" "$@" ;;
+  fake)         refuse_if_service; need_ros; exec "$PY" "$KIT/host/link_bridge.py" --fake "$@" ;;
+  cmd)          need_ros; exec "$PY" "$KIT/host/cmd_station.py" "$@" ;;
+  test)         need_ros; exec "$PY" "$KIT/host/cmd_station.py" --auto test "$@" ;;
+  demo)         need_ros; exec "$PY" "$KIT/host/cmd_station.py" --auto demo "$@" ;;
+  set)          cmd_set "$@" ;;
+  static)       cmd_static "$@" ;;
+  peers)        cmd_peers "$@" ;;
+  service)      cmd_service "$@" ;;
+  logs)         cmd_logs ;;
+  sshkey)       cmd_sshkey ;;
+  push)         cmd_push ;;
+  jetson)       cmd_jetson "$@" ;;
+  setup)        exec bash "$KIT/setup.sh" "$@" ;;
+  install-ros)  cmd_install_ros "$@" ;;
+  version)      echo "$VERSION" ;;
+  *)            echo "${R}unknown command: $sub${N}"; menu; exit 1 ;;
+esac
